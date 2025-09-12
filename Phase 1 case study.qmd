@@ -1,0 +1,233 @@
+---
+title: "Phase 1 case study: Preliminary projections before local spread"
+format: html
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SobolSequence)
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(tidyverse)
+```
+
+## Define best-guess parameters and reasonable ranges
+
+```{r}
+#Projection time frame
+time = 1:42 #42 days = 6 weeks
+
+#Define parameters
+#What is the epidemic doubling time?
+#Note: doubling time is log(2)/growth rate
+par_doubling_time = 3.5 #days
+par_doubling_time_range = c(3, 4)
+
+#What fraction of infections are reported?
+par_reporting_fraction = 0.25
+par_reporting_fraction_range = c(0.05, 0.50)
+
+#What fraction of reported cases are hospitalized?
+par_hosp_fraction = 0.1
+par_hosp_fraction_range = c(0.02, 0.2)
+
+#What fraction of reported cases die?
+par_death_fraction = 0.03
+par_death_fraction_range = c(0.01, 0.05)
+
+#What is the delay between infection and case reporting?
+par_case_delay = 6 #days
+par_case_delay_range = c(4, 10) #days
+
+#What is the delay between case reporting and hospitalization?
+par_hosp_delay = 6 #days
+par_hosp_delay_range = c(4, 10) #days
+
+#What is the delay between case reporting and death?
+par_death_delay = 15 #days
+par_death_delay_range = c(10, 20) #days
+```
+
+```{r, include=FALSE}
+#Compute best-guess projections of daily counts
+modeled_infec = 2^((time+par_case_delay)/par_doubling_time)/par_reporting_fraction #Y(t)
+modeled_cases = 2^(time/par_doubling_time) #C(t)
+modeled_hosps = 2^((time-par_hosp_delay)/par_doubling_time)*par_hosp_fraction #H(t)
+modeled_death = 2^((time-par_death_delay)/par_doubling_time)*par_death_fraction #D(t)
+
+#Cumulative counts
+cumulative_infec = cumsum(modeled_infec)
+cumulative_cases = cumsum(modeled_cases)
+cumulative_hosps = cumsum(modeled_hosps)
+cumulative_death = cumsum(modeled_death)
+```
+
+```{r, include=FALSE}
+#Uncertainty quantification
+
+nsample = 1E4
+#Use a Sobol sample to generate parameter combinations
+sobol_sample = sobolSequence.points(7,count=nsample)
+#The original sample selects values between 0 and 1, and we need to translate these numbers to values in our parameter ranges.
+param_low =  c(par_doubling_time_range[1],
+              par_reporting_fraction_range[1],
+              par_hosp_fraction_range[1],
+              par_death_fraction_range[1],
+              par_case_delay_range[1],
+              par_hosp_delay_range[1],
+              par_death_delay_range[1])
+param_high =  c(par_doubling_time_range[2],
+              par_reporting_fraction_range[2],
+              par_hosp_fraction_range[2],
+              par_death_fraction_range[2],
+              par_case_delay_range[2],
+              par_hosp_delay_range[2],
+              par_death_delay_range[2])
+scaled_sample = t(param_low + (param_high-param_low)*t(sobol_sample))
+#These values are now scaled appropriately.
+
+#Initialize matrices of outcomes
+UQ_matrix_infec = matrix(NA, nrow=nsample, ncol=length(time))
+UQ_matrix_cases = matrix(NA, nrow=nsample, ncol=length(time))
+UQ_matrix_hosps = matrix(NA, nrow=nsample, ncol=length(time))
+UQ_matrix_death = matrix(NA, nrow=nsample, ncol=length(time))
+
+#For every sampled set of parameters, compute the projections
+for (i in 1:nsample){
+  
+  #Extract parameters
+  sample_par_doubling_time              = scaled_sample[i,1]
+  sample_par_reporting_fraction         = scaled_sample[i,2]
+  sample_par_hosp_fraction              = scaled_sample[i,3]
+  sample_par_death_fraction             = scaled_sample[i,4]
+  sample_par_case_delay                 = scaled_sample[i,5]
+  sample_par_hosp_delay                 = scaled_sample[i,6]
+  sample_par_death_delay                = scaled_sample[i,7]
+  
+  #Compute daily counts for the sampled parameter set
+  sample_infec = 2^((time+sample_par_case_delay)/sample_par_doubling_time)/sample_par_reporting_fraction #Y(t)
+  sample_cases = 2^(time/sample_par_doubling_time) #C(t)
+  sample_hosps = 2^((time-sample_par_hosp_delay)/sample_par_doubling_time)*sample_par_hosp_fraction #H(t)
+  sample_death = 2^((time-sample_par_death_delay)/sample_par_doubling_time)*sample_par_death_fraction #D(t)
+
+  #Record outcomes
+  UQ_matrix_infec[i,] = sample_infec
+  UQ_matrix_cases[i,] = sample_cases
+  UQ_matrix_hosps[i,] = sample_hosps
+  UQ_matrix_death[i,] = sample_death
+
+}
+
+#Calculate pointwise credible intervals
+low50_infec = apply(UQ_matrix_infec,2,FUN=quantile, probs=0.25)
+low95_infec = apply(UQ_matrix_infec,2,FUN=quantile, probs=0.025)
+high50_infec = apply(UQ_matrix_infec,2,FUN=quantile, probs=0.75)
+high95_infec = apply(UQ_matrix_infec,2,FUN=quantile, probs=0.975)
+
+low50_cases = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.25)
+low95_cases = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.025)
+high50_cases = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.75)
+high95_cases = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.975)
+
+low50_hosps = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.25)
+low95_hosps = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.025)
+high50_hosps = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.75)
+high95_hosps = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.975)
+
+low50_death = apply(UQ_matrix_death,2,FUN=quantile, probs=0.25)
+low95_death = apply(UQ_matrix_death,2,FUN=quantile, probs=0.025)
+high50_death = apply(UQ_matrix_death,2,FUN=quantile, probs=0.75)
+high95_death = apply(UQ_matrix_death,2,FUN=quantile, probs=0.975)
+
+#Merge data and credible intervals
+data_and_UQ = as.data.frame(cbind(time, 
+                                  modeled_infec, modeled_cases,
+                                  modeled_hosps, modeled_death,
+                                  low50_infec, low95_infec,
+                                  high50_infec, high95_infec,
+                                  low50_cases, low95_cases,
+                                  high50_cases, high95_cases,
+                                  low50_hosps, low95_hosps, 
+                                  high50_hosps, high95_hosps,
+                                  low50_death, low95_death, 
+                                  high50_death, high95_death))
+```
+## Projections
+Projections at 6 weeks
+```{r, echo=FALSE}
+#Final 6-week projections
+print(round(unlist(data_and_UQ[nrow(data_and_UQ), 
+                               c("modeled_infec", 
+                                 "low50_infec","high50_infec",
+                                 "low95_infec", "high95_infec")]),
+            digits=-3))
+
+print(round(unlist(data_and_UQ[nrow(data_and_UQ),
+                               c("modeled_cases", 
+                                 "low50_cases","high50_cases",
+                                 "low95_cases", "high95_cases")]), 
+            digits=-2))
+
+print(round(unlist(data_and_UQ[nrow(data_and_UQ),
+                               c("modeled_hosps", 
+                                 "low50_hosps","high50_hosps",
+                                 "low95_hosps","high95_hosps")]),
+            digits=-1))
+
+print(round(unlist(data_and_UQ[nrow(data_and_UQ),
+                               c("modeled_death", 
+                                 "low50_death","high50_death",
+                                 "low95_death","high95_death")]),
+            digits=0))
+```
+
+## Visualization
+```{r, echo=FALSE}
+#Cases
+plot_4a= ggplot(data_and_UQ , aes(x=time))+
+  #Plot uncertainty regions
+  geom_ribbon(aes(ymin = low95_cases, ymax= high95_cases), fill="black", alpha=0.15)+
+  geom_ribbon(aes(ymin = low50_cases, ymax= high50_cases), fill="black", alpha=0.30)+
+  #Plot best-guess projection
+  geom_line(aes(y=modeled_cases), color="black", linetype=2)+
+  #Additional plotting parameters
+  theme_classic(base_size=12)+
+  ylab("Cases")+xlab("Days")+
+  theme_classic(base_size=14)
+
+#Hospitalizations
+plot_4b= ggplot(data_and_UQ, aes(x=time))+
+  #Plot uncertainty regions
+  geom_ribbon(aes(ymin = low95_hosps, ymax= high95_hosps), fill="#D55E00", alpha=0.15)+
+  geom_ribbon(aes(ymin = low50_hosps, ymax= high50_hosps), fill="#D55E00", alpha=0.30)+
+  #Plot best-guess projection
+  geom_line(aes(y=modeled_hosps),color="#D55E00",linetype=2)+
+  #Additional plotting parameters
+  theme_classic(base_size=12)+
+  ylab("Hospitalizations")+xlab("Days")+
+  theme_classic(base_size=14)
+
+#Deaths
+plot_4c= ggplot(data_and_UQ ,aes(x=time))+
+  #Plot uncertainty regions
+  geom_ribbon(aes(ymin = low95_death, ymax= high95_death), fill="#2F65A7", alpha=0.15)+
+  geom_ribbon(aes(ymin = low50_death, ymax= high50_death), fill="#2F65A7", alpha=0.30)+
+  #Plot best-guess projection
+  geom_line(aes(x=time,y=modeled_death),color="#2F65A7",linetype=2)+
+  #Additional plotting parameters
+  theme_classic(base_size=12)+
+  ylab("Deaths")+xlab("Days")+
+  theme_classic(base_size=14)
+
+plot_4= ggarrange(plot_4a,plot_4b,plot_4c,
+                  nrow=1,ncol=3,
+                  labels=c("A)","B)","C)"))
+plot_4
+```
+
+```{r, include=FALSE}
+#Save plots
+ggsave("Figure 4.png",plot_4,height=4/3, width=6,scale=2)
+ggsave("Figure 4.pdf",plot_4,height=4/3, width=6,scale=2)
+```

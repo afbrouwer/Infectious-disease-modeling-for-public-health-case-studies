@@ -1,0 +1,861 @@
+---
+title: "Phase 3 case study: Established transmission with potential interventions"
+format: html
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SobolSequence)
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(tidyverse)
+library(numDeriv)
+library(SimDesign)
+library(deSolve)
+library(viridis)
+library(tictoc)
+library(lubridate)
+
+data = read_csv("Michigan_data.csv")
+```
+
+```{r, include=FALSE}
+#Infectious disease model and simulation functions
+
+#Ordinary differential equation function
+SLIR_model = function(t, x, model_par){
+  
+  beta  = model_par[1] #transmission rate
+  sigma = model_par[2] #rate of leaving latency
+  gamma = model_par[3] #rate of recovery
+
+  #Fraction of at-risk population that is...
+  S = x[1] #... susceptible
+  L1= x[2] #... latent 1
+  L2= x[3] #... latent 2
+  I1= x[4] #... infectious 1
+  I2= x[5] #... infectious 2
+  
+  #Cumulative fraction of at-risk population that
+  Ibar= x[6]  #... was ever infectious
+  
+  dSdt  = -beta*S*(I1+I2)
+  dL1dt = beta*S*(I1+I2) - 2*sigma*L1
+  dL2dt = 2*sigma*L1 - 2*sigma*L2
+  dI1dt = 2*sigma*L2 - 2*gamma*I1 
+  dI2dt = 2*gamma*(I1 - I2)
+
+  dIbardt = 2*sigma*L2
+  
+  return(list(c(dSdt, dL1dt, dL2dt, dI1dt, dI2dt, dIbardt)))
+}
+
+#Simulate ODE as a function of the parameters
+simulate_model_ph3 = function(par,data){
+
+  #Sampled or fixed parameters
+  sigma   = par[1] #rate of leaving latency
+  gamma   = par[2] #rate of recovery from infectiousness
+  I0      = par[3] #fraction initially infected
+  tau_IC  = par[4] #delay between infections and cases
+  tau_CH  = par[5] #delay between cases and hospitalizations
+  tau_CD  = par[6] #delay between cases and deaths
+
+  #Estimated parameters
+  beta    = par[7]  #transmission rate
+  kphi_IC = par[8]  #size of population at-risk times the infection–case ratio
+  phi_CH  = par[9]  #case-hospitalization ratio
+  phi_CD  = par[10] #case-fatality ratio
+
+  # browser()
+  
+  #Initial conditions
+  I0_1 = I0/2
+  I0_2 = I0/2
+  L0_2 = I0_1*gamma/sigma
+  L0_1 = L0_2
+  x0 = c('S'=1-L0_1-L0_2-I0_1-I0_2,
+         'L_1'=L0_1, 'L_2'=L0_2,
+         'I_1'=I0_1, 'I_2'=I0_2,
+         'Ibar'=0)
+  
+  #Run ODE model
+  out = ode(x0, times = 0:nrow(data), SLIR_model, c(beta,sigma,gamma))#, method="vode")
+
+  #Difference in cumulative cases = daily cases
+  modeled_cases = kphi_IC * diff(out[,7])[1:nrow(data)]
+  #Difference in cumulative hospitalizations = daily hospital admissions
+  modeled_hosps = c(rep(0,tau_CH), kphi_IC * phi_CH * diff(out[,7]))[1:nrow(data)] 
+  #Difference in deaths cases = daily deaths
+  modeled_death = c(rep(0,tau_CD), kphi_IC * phi_CD * diff(out[,7]))[1:nrow(data)]
+  
+  #Format output  
+  modeled_data=as.data.frame(cbind(modeled_cases, modeled_hosps, modeled_death))
+  colnames(modeled_data) = c("modeled_cases","modeled_hosps","modeled_death")
+  
+  return(modeled_data)
+}
+
+#Calculate the goodness of fit to the data as function of the parameters
+calculate_NLL_ph3 = function(par, data){
+  
+  #Simulate model and extract modeled data streams
+  modeled_data = simulate_model_ph3(par, data)
+  modeled_cases = modeled_data$modeled_cases
+  modeled_hosps = modeled_data$modeled_hosps
+  modeled_death = modeled_data$modeled_death
+
+  #Calculate negative log-likelihood for each data stream
+  NLL_cases = -sum(dpois(data$Cases[data$period_cases == "data"],
+                         modeled_cases[data$period_cases == "data"],
+                         log=TRUE)) 
+  NLL_hosps = -sum(dpois(data$Hospitalizations[data$period_hosps == "data"],
+                         modeled_hosps[data$period_hosps == "data"],
+                         log=TRUE))
+  NLL_death = -sum(dpois(data$Deaths[data$period_death == "data"],
+                         modeled_death[data$period_death == "data"],
+                         log=TRUE))
+  
+  #Data sets given weight relative to size
+  NLL = (NLL_cases + NLL_hosps + NLL_death)
+  
+  return(NLL)
+}
+
+
+#Use a wrapper for the likelihood calculation that accounts for parameter transformations that allow for unconstrained optimization 
+NLL_wrapper = function(par_estimated, par_not_estimated, data){
+  
+  par=unname(c(par_not_estimated,par_estimated))
+  #[1] sigma   #rate of leaving latency
+  #[2] gamma   #rate of recovery from infectiousness
+  #[3] I0      #fraction initially infected
+  #[4] tau_IC  #delay between infections and cases
+  #[5] tau_CH  #delay between cases and hospitalizations
+  #[6] tau_CD  #delay between cases and deaths
+  #[7] beta    #transmission rate
+  #[8] kphi_IC #size of population at-risk times the infection–case ratio
+  #[9] logit(phi_CH)  #logit(case-hospitalization ratio)
+  #[10] logit(phi_CD)  #loigt(transformed case-fatality ratio)
+  
+  #Ensure parameters are positive
+  par[c(1:8)] = abs(par[c(1:8)])
+  #Untransform the transformed parameters for likelihood calculation
+  par[9] = exp(par[9])/(1+exp(par[9]))
+  par[10] = exp(par[10])/(1+exp(par[10]))
+
+  NLL = calculate_NLL_ph3(par, data)
+  
+  if(is.na(NLL)){print(c(par))}
+  
+  return(NLL)
+}
+
+#Use a wrapper for the optimization that transforms parameters for unconstrained optimization 
+optimization_wrapper = function(par_estimated, par_not_estimated, data){
+  
+  #par_estimated
+  #[1] beta    #transmission rate
+  #[2] kphi_IC #size of population at-risk times the infection–case ratio
+  #[3] phi_CH  #case-hospitalization ratio
+  #[4] phi_CD  #case-fatality ratio
+  #par_not_estimated
+  #[1] sigma   #rate of leaving latency
+  #[2] gamma   #rate of recovery from infectiousness
+  #[3] I0      #fraction initially infected
+  #[4] tau_IC  #delay between infections and cases
+  #[5] tau_CH  #delay between cases and hospitalizations
+  #[6] tau_CD  #delay between cases and deaths
+  
+  #Use logit transformation on the two fraction parameters (phi_CH and phi_CD) so that optimization is unconstrained 
+  par_estimated[3:4] = c(
+    log(par_estimated[3]/(1-par_estimated[3])),               
+    log(par_estimated[4]/(1-par_estimated[4])))
+  
+  #Use maximum-likelihood estimation to estimate par_estimated values
+  out = optim(par = par_estimated,
+             fn= NLL_wrapper,
+             par_not_estimated = par_not_estimated,
+             data = data,
+             hessian = FALSE,
+             control=list(maxit=1E4,
+                          parscale=c(1,1E6,1,1))) #ensure similar scaling
+  
+  #Untransform parameters for interpretation and simulation 
+  out$par[1:2] = abs(out$par[1:2]) 
+  out$par[3] = exp(out$par[3])/(1+exp(out$par[3]))
+  out$par[4] = exp(out$par[4])/(1+exp(out$par[4]))
+  
+  return(out)
+}
+```
+
+## Define data and projection periods
+```{r}
+today = as.Date("2021-04-05")
+
+data_length =  42  #Look back 6 weeks = 42 days
+data_project = 28  #Project 4 weeks = 28 days
+case_burn = 7      #Do not use previous 1 week of case data
+day_start = today - data_length
+```
+
+```{r,include=FALSE}
+#Subset data to the look-back and projection periods
+data_period <- data|>
+  filter((Date >= day_start) & 
+    (Date < day_start + days(data_length+data_project)))
+```
+
+## Parameters
+```{r}
+#Define parameter ranges to be sampled
+#Rate of latency to infectious transition
+par_sigma_range = c(1/8, 1/4) #1/days
+#Rate of recovery
+par_gamma_range = c(1/10, 1/5) #1/days
+#Initial fraction infectious
+par_I0_range    = c(1E-6, 1E-2)
+#Case reporting delay
+par_cases_delay_range = c(4, 10) #days
+
+#Define parameters to be fixed
+#Hospitalization delay
+par_hosps_delay = 6 #days
+#Death delay
+par_death_delay = 15 #days
+```
+
+```{r, include=FALSE}
+#Define view windows for each data stream
+data_period <- data_period|>
+  mutate(period_cases = c(rep("data",data_length-case_burn),
+                          rep("project",data_project+case_burn)),
+         period_hosps = c(rep("drop", par_hosps_delay),
+                          rep("data",data_length-par_hosps_delay),
+                          rep("project",data_project)),
+         period_death = c(rep("drop", par_death_delay),
+                          rep("data",data_length-par_death_delay),
+                          rep("project",data_project)))
+```
+
+```{r, include=FALSE}
+#We are using a relatively small number of samples in this case study 
+# because of the computational burden. A larger number can be used 
+# if time and computational power allow.
+nsample = 5E2
+
+#Uncertainty quantification function
+UQ_function_ph3 = function(data_period, nsample){
+
+  #Sobol sample
+  sobol_sample = cbind(sobolSequence.points(3,count=nsample),
+                       matrix(1,nrow=nsample, ncol=3))
+  #The original sample selects values between 0 and 1, and we need to translate these numbers to values in our parameter ranges.
+  param_low =  c(par_sigma_range[1],
+                par_gamma_range[1], 
+                par_I0_range[1],
+                par_cases_delay_range[1],
+                par_hosps_delay, 
+                par_death_delay)
+  param_high =  c(par_sigma_range[2],
+                par_gamma_range[2], 
+                par_I0_range[2],
+                par_cases_delay_range[2], 
+                par_hosps_delay, 
+                par_death_delay)
+  scaled_sample = t(param_low + (param_high-param_low)*t(sobol_sample))
+  #These values are now scaled appropriately.
+
+  #Initialize output matrices
+  UQ_matrix_cases  = matrix(0, nrow=nsample, ncol=nrow(data_period))
+  UQ_matrix_hosps  = matrix(0, nrow=nsample, ncol=nrow(data_period))
+  UQ_matrix_death  = matrix(0, nrow=nsample, ncol=nrow(data_period))
+  UQ_matrix_par    = matrix(0, nrow=nsample, ncol=11)
+
+  #Loop over samples
+  for (i in 1:nsample){
+    
+    #Print every time samples so that we can monitor progress
+    if( i %% 10 == 0 ){print(i)}
+    
+    #Find best fit trajectory for this sampled parameter set
+    out_temp = optimization_wrapper(par_estimated = c('beta'= 3/7,
+                                             'kphi_IC'= 1E6,
+                                             'phi_CH' = 0.1,
+                                             'phi_CD' = 0.02),
+                           par_not_estimated = scaled_sample[i,],
+                           data = data_period)
+    
+    #Simulate and record best-fit trajectory
+    sample_projection = simulate_model_ph3(c(scaled_sample[i,],
+                                             out_temp$par), data_period)
+
+    UQ_matrix_cases[i,]  = sample_projection[,1]
+    UQ_matrix_hosps[i,]  = sample_projection[,2]
+    UQ_matrix_death[i,]  = sample_projection[,3]
+    UQ_matrix_par[i,]    = c(out_temp$value, scaled_sample[i,], out_temp$par)
+
+  }
+  
+  #Subset to fits that reasonably explain the data
+  index_decent_fit = which(UQ_matrix_par[,1] < 1.1*min(UQ_matrix_par[,1]))
+  UQ_matrix_par   = UQ_matrix_par[index_decent_fit,]
+  UQ_matrix_cases = UQ_matrix_cases[index_decent_fit,]
+  UQ_matrix_hosps = UQ_matrix_hosps[index_decent_fit,]
+  UQ_matrix_death = UQ_matrix_death[index_decent_fit,]
+
+  #Calculate credible intervals
+  median_cases = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.5)
+  low50_cases  = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.25)
+  low95_cases  = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.025)
+  high50_cases = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.75)
+  high95_cases = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.975)
+  
+  median_hosps = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.5)
+  low50_hosps  = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.25)
+  low95_hosps  = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.025)
+  high50_hosps = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.75)
+  high95_hosps = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.975)
+
+  median_death = apply(UQ_matrix_death,2,FUN=quantile, probs=0.5)
+  low50_death  = apply(UQ_matrix_death,2,FUN=quantile, probs=0.25)
+  low95_death  = apply(UQ_matrix_death,2,FUN=quantile, probs=0.025)
+  high50_death = apply(UQ_matrix_death,2,FUN=quantile, probs=0.75)
+  high95_death = apply(UQ_matrix_death,2,FUN=quantile, probs=0.975)
+
+  data_fits_UQ = as.data.frame(cbind(data_period,
+                                     median_cases, 
+                                     low50_cases, low95_cases,
+                                     high50_cases, high95_cases, 
+                                     median_hosps, 
+                                     low50_hosps, low95_hosps, 
+                                     high50_hosps, high95_hosps, 
+                                     median_death, 
+                                     low50_death, low95_death, 
+                                     high50_death, high95_death))
+  
+  UQ_matrix_cases_all_traj = as.data.frame(t(UQ_matrix_cases))
+  UQ_matrix_cases_all_traj$Date = data_period$Date
+  
+  return(list(data_fits_UQ, UQ_matrix_par, UQ_matrix_cases_all_traj))
+}
+```
+
+```{r, include= FALSE}
+#Uncertainty quantification for the case study
+data_fits_UQ_list = UQ_function_ph3(data_period, nsample)
+data_fits_UQ = data_fits_UQ_list[[1]]
+```
+
+## Projections
+Projections at 4 weeks
+```{r, echo=FALSE}
+#Final 4-week projections (6 weeks data + 4 weeks projections = 10 weeks = 70 days)
+print(round(unlist(data_fits_UQ[nrow(data_fits_UQ),
+                                c("median_cases", "low50_cases",
+                                "high50_cases", "low95_cases",
+                                "high95_cases")]),digits=-2))
+
+print(round(unlist(data_fits_UQ[nrow(data_fits_UQ),
+                                c("median_hosps", "low50_hosps",
+                                "high50_hosps", "low95_hosps",
+                                "high95_hosps")]),digits=-1))
+
+print(round(unlist(data_fits_UQ[nrow(data_fits_UQ),
+                                c("median_death", "low50_death",
+                                "high50_death", "low95_death",
+                                "high95_death")]),digits=0))
+```
+
+## Visualization
+### Status quo scenario
+```{r, echo=FALSE}
+plot_6a=ggplot()+
+  #Plot uncertainty regions
+  geom_ribbon(data= data_fits_UQ,
+               aes(x=Date, ymin = low95_cases, ymax= high95_cases),
+               fill="grey25",alpha=0.15)+
+  geom_ribbon(data=data_fits_UQ,
+                aes(x=Date, ymin = low50_cases, ymax= high50_cases),
+                fill="grey25",alpha=0.30)+
+  #Plot data
+  geom_point(data=data_fits_UQ|>filter(period_cases=="data"),
+             aes(x=Date,y=Cases),
+             color="grey25",alpha=1,pch=19)+
+  #Plot median projection
+  geom_line(data=data_fits_UQ,
+            aes(x=Date,y=median_cases,linetype=period_cases),
+            color="grey35")+
+  #Vertical line for today's date
+  geom_vline(xintercept=today,color="grey80")+
+  #Additional plotting parameters
+  scale_linetype_manual(guide="none", values=c(1,2))+
+  scale_x_date(date_breaks = "1 month", date_labels =  "%b %Y")+
+  xlab("Date")+ylab("Cases")+
+  ylim(0,max(data_fits_UQ[,c("high95_cases", "Cases")]))+
+  theme_classic(base_size=14)+
+  theme(axis.text.x=element_text(angle=20, hjust=1))
+
+plot_6b=ggplot()+
+  #Plot uncertainty regions
+  geom_ribbon(data=data_fits_UQ|>filter(period_hosps!="drop"),
+               aes(x=Date, ymin = low95_hosps, ymax= high95_hosps),
+               fill="#D86018", alpha=0.15)+
+  geom_ribbon(data=data_fits_UQ|>filter(period_hosps!="drop"),
+                aes(x=Date, ymin = low50_hosps, ymax= high50_hosps),
+                fill="#D86018",alpha=0.30)+
+  #Plot data
+  geom_point(data=data_fits_UQ|>filter(period_hosps!="project"),
+             aes(x=Date,y=Hospitalizations,fill=period_hosps),
+             color="#D86018",alpha=1,pch=21)+
+  #Plot median projection
+  geom_line(data=data_fits_UQ,
+            aes(x=Date,y=median_hosps,linetype=period_hosps),
+            color="#D86018")+
+  #Vertical line for today's date
+  geom_vline(xintercept=today,color="grey80")+
+  #Additional plotting parameters
+  scale_fill_manual(guide="none", values=c("#D86018","white"))+
+  scale_linetype_manual(guide="none", values=c(1,0,2))+
+  scale_x_date(date_breaks = "1 month", date_labels =  "%b %Y")+
+  xlab("Date")+ylab("Hospitalizations")+
+  ylim(0,max(data_fits_UQ[,c("high95_hosps", "Hospitalizations")]))+
+  theme_classic(base_size=14)+
+  theme(axis.text.x=element_text(angle=20, hjust=1))
+
+plot_6c=ggplot()+
+  #Plot uncertainty regions
+  geom_ribbon(data=data_fits_UQ|>filter(period_death!="drop"),
+               aes(x=Date, ymin = low95_death, ymax= high95_death),
+               fill="#2F65A7", alpha=0.15)+
+  geom_ribbon(data=data_fits_UQ|>filter(period_death!="drop"),
+                aes(x=Date, ymin = low50_death, ymax= high50_death),
+                fill="#2F65A7",alpha=0.30)+
+  #Plot data
+  geom_point(data=data_fits_UQ|>filter(period_death!="project"),
+             aes(x=Date,y=Deaths,fill=period_death),
+             color="#2F65A7",alpha=1,pch=21)+
+  #Plot median projection
+  geom_line(data=data_fits_UQ,
+            aes(x=Date,y=median_death,linetype=period_death),
+            color="#2F65A7")+
+  #Vertical line for today's date
+  geom_vline(xintercept=today,color="grey80")+
+  #Additional plotting parameters
+  scale_fill_manual(guide="none", values=c("#2F65A7","white"))+
+  scale_linetype_manual(guide="none", values=c(1,0,2))+
+  scale_x_date(date_breaks = "1 month", date_labels =  "%b %Y")+
+  xlab("Date")+ylab("Deaths")+
+  ylim(0,max(data_fits_UQ[,c("high95_death", "Deaths")]))+
+  theme_classic(base_size=14)+
+  theme(axis.text.x=element_text(angle=20, hjust=1))
+
+ggarrange(plot_6a,plot_6b,plot_6c,nrow=1,ncol=3)
+```
+
+```{r, include=FALSE}
+#Intervention simulation
+
+simulate_intervention_ph3 = function(par,data,beta_frac){
+  
+ #Sampled or fixed parameters
+  sigma   = par[1] #rate of leaving latency
+  gamma   = par[2] #rate of recovery from infectiousness
+  I0      = par[3] #fraction initially infected
+  tau_IC  = par[4] #delay between infections and cases
+  tau_CH  = par[5] #delay between infections and hospitalizations
+  tau_CD  = par[6] #delay between infections and deaths
+
+  #Estimated parameters
+  beta    = par[7]  #transmission rate
+  kphi_IC = par[8]  #size of population at-risk times the reporting fraction
+  phi_CH  = par[9]  #case-hospitalization ratio
+  phi_CD  = par[10] #case-fatality ratio
+  
+  #Initial conditions
+  I0_1 = I0/2
+  I0_2 = I0/2
+  L0_2 = I0_1*gamma/sigma
+  L0_1 = L0_2
+  x0 = c('S'=1-L0_1-L0_2-I0_1-I0_2,
+         'L_1'=L0_1, 'L_2'=L0_2,
+         'I_1'=I0_1, 'I_2'=I0_2,
+         'Ibar'=0)
+  
+  #These times assume that the intervention starts on today's date, 
+  # but that can be changed as desired.
+  times1 = 0:nrow(data[data$period_hosps!="project",])
+  times2 = nrow(data[data$period_hosps!="project",]):nrow(data)
+  
+  #Before intervention
+  out1 = ode(x0, times1, SLIR_model, c(beta,sigma,gamma),method="vode")
+  #After intervention
+  out2 = ode(tail(out1[,2:ncol(out1)],1), times2, SLIR_model, c(beta*beta_frac,sigma,gamma),method="vode")
+  #Combine simulations
+  out=rbind(out1,out2[-1,])
+  
+  #Difference in cumulative cases = daily cases
+  modeled_cases = kphi_IC * diff(out[,7])[1:nrow(data)]
+  #Difference in cumulative hospitalizations = daily hospital admissions
+  modeled_hosps = c(rep(0,tau_CH), kphi_IC * phi_CH * diff(out[,7]))[1:nrow(data)] 
+  #Difference in deaths cases = daily deaths
+  modeled_death = c(rep(0,tau_CD), kphi_IC * phi_CD * diff(out[,7]))[1:nrow(data)]
+  
+  #Format output  
+  modeled_data=as.data.frame(cbind(modeled_cases, modeled_hosps, modeled_death))
+  colnames(modeled_data) = c("modeled_cases","modeled_hosps","modeled_death")
+  
+  return(modeled_data)
+}
+
+intervention_function_ph3 = function(data_fits, data_UQ_par, beta_frac){
+  
+  #Allocate output matrices
+  nsample=nrow(data_UQ_par)
+  UQ_matrix_cases  = matrix(NA, nrow=nsample, ncol=nrow(data_fits))
+  UQ_matrix_hosps  = matrix(NA, nrow=nsample, ncol=nrow(data_fits))
+  UQ_matrix_death  = matrix(NA, nrow=nsample, ncol=nrow(data_fits))
+  
+  #For each parameter sample
+  for (i in 1:nsample){
+
+    #Simulate the intervention
+    sample_projection = simulate_intervention_ph3(data_UQ_par[i,], data_fits, beta_frac)
+
+    UQ_matrix_cases[i,] = sample_projection[,1]
+    UQ_matrix_hosps[i,] = sample_projection[,2]
+    UQ_matrix_death[i,] = sample_projection[,3]
+  }
+
+
+  #Calculate credible intervals
+  median_cases = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.5)
+  low50_cases  = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.25)
+  low95_cases  = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.025)
+  high50_cases = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.75)
+  high95_cases = apply(UQ_matrix_cases,2,FUN=quantile, probs=0.975)
+  
+  median_hosps = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.5)
+  low50_hosps  = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.25)
+  low95_hosps  = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.025)
+  high50_hosps = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.75)
+  high95_hosps = apply(UQ_matrix_hosps,2,FUN=quantile, probs=0.975)
+
+
+  median_death = apply(UQ_matrix_death,2,FUN=quantile, probs=0.5)
+  low50_death  = apply(UQ_matrix_death,2,FUN=quantile, probs=0.25)
+  low95_death  = apply(UQ_matrix_death,2,FUN=quantile, probs=0.025)
+  high50_death = apply(UQ_matrix_death,2,FUN=quantile, probs=0.75)
+  high95_death = apply(UQ_matrix_death,2,FUN=quantile, probs=0.975)
+
+
+  data_fits_UQ = as.data.frame(cbind(data_fits,median_cases, low50_cases, low95_cases, high50_cases, high95_cases, median_hosps, low50_hosps, low95_hosps, high50_hosps, high95_hosps, median_death,low50_death, low95_death,                             high50_death, high95_death))
+
+  return(data_fits_UQ)
+}
+```
+
+## Alternative scenarios
+```{r}
+#Lower and higher transmission scenarios
+beta_frac_low  = 1 - 0.25 # 25% reduced transmission
+beta_frac_high = 1 + 0.25 # 25% increased transmission
+
+#Retrospective scenario
+beta_retro = 1 - 0.45 #45% reduced transmission scenario
+```
+
+```{r, include=FALSE}
+#Scenarios
+
+#Increased transmission scenario
+data_intervention_UQ_high_beta =intervention_function_ph3(data_period,data_fits_UQ_list[[2]][,-1],beta_frac=beta_frac_high)
+
+#Decreased transmission scenario
+data_intervention_UQ_low_beta =intervention_function_ph3(data_period,data_fits_UQ_list[[2]][,-1],beta_frac=beta_frac_low)
+
+#Retrospective scenario
+data_intervention_UQ_retro =intervention_function_ph3(data_period,data_fits_UQ_list[[2]][,-1],beta_frac=beta_retro)
+```
+
+### Higher transmission scenario
+```{r, echo=FALSE}
+print(round(unlist(data_intervention_UQ_high_beta[nrow(data_intervention_UQ_high_beta),
+                                c("median_cases", "low50_cases",
+                                "high50_cases", "low95_cases",
+                                "high95_cases")]),digits=-2))
+
+print(round(unlist(data_intervention_UQ_high_beta[nrow(data_intervention_UQ_high_beta),
+                                c("median_hosps", "low50_hosps",
+                                "high50_hosps", "low95_hosps",
+                                "high95_hosps")]),digits=-1))
+
+print(round(unlist(data_intervention_UQ_high_beta[nrow(data_intervention_UQ_high_beta),
+                                c("median_death", "low50_death",
+                                "high50_death", "low95_death",
+                                "high95_death")]),digits=0))
+```
+
+### Lower transmission scenario
+```{r, echo=FALSE}
+print(round(unlist(data_intervention_UQ_low_beta[nrow(data_intervention_UQ_low_beta),
+                                c("median_cases", "low50_cases",
+                                "high50_cases", "low95_cases",
+                                "high95_cases")]),digits=-2))
+
+print(round(unlist(data_intervention_UQ_low_beta[nrow(data_intervention_UQ_low_beta),
+                                c("median_hosps", "low50_hosps",
+                                "high50_hosps", "low95_hosps",
+                                "high95_hosps")]),digits=-1))
+
+print(round(unlist(data_intervention_UQ_low_beta[nrow(data_intervention_UQ_low_beta),
+                                c("median_death", "low50_death",
+                                "high50_death", "low95_death",
+                                "high95_death")]),digits=0))
+```
+### Higher and lower transmission scenarios
+Scenarios with +/- 25% transmission
+```{r, echo=FALSE}
+#Cases
+plot_6d= ggplot()+
+  #Plot uncertainty region for lower transmission scenario
+  geom_ribbon(data=data_intervention_UQ_low_beta,
+              aes(x=Date, ymin = low95_cases, ymax= high95_cases),
+              fill="grey50",alpha=0.15)+
+  #Plot uncertainty region for higher transmission scenario
+  geom_ribbon(data=data_intervention_UQ_high_beta,
+              aes(x=Date, ymin = low95_cases, ymax= high95_cases),
+              fill="black", alpha=0.15)+
+  #Plot uncertainty region for status-quo scenario
+  geom_ribbon(data=data_fits_UQ,
+              aes(x=Date, ymin = low50_cases, ymax= high50_cases),
+              fill="grey25",alpha=0.15)+
+  #Plot data
+  geom_point(data=data_fits_UQ|>filter(period_cases=="data"),
+             aes(x=Date,y=Cases),
+             color="grey25",alpha=1,pch=19)+
+  #Plot median projection for lower transmission scenario
+  geom_line(data=data_intervention_UQ_low_beta,
+            aes(x=Date,y=median_cases,linetype=period_cases),
+            color="grey50")+
+  #Plot median projection for higher transmission scenario
+  geom_line(data=data_intervention_UQ_high_beta,
+            aes(x=Date,y=median_cases,linetype=period_cases),
+            color="black")+
+  #Plot median projection for status-quo scenario
+  geom_line(data=data_fits_UQ,
+            aes(x=Date,y=median_cases,linetype=period_cases),
+            color="grey25")+
+  #Vertical line for today's date
+  geom_vline(xintercept=today,color="grey80")+
+  #Additional plotting parameters
+  scale_linetype_manual(guide="none", values=c(1,2))+
+  scale_x_date(date_breaks = "1 month", date_labels =  "%b %Y")+
+  xlab("Date")+ylab("Cases")+
+  theme_classic(base_size=14)+
+  theme(axis.text.x=element_text(angle=20, hjust=1))
+
+#Hospitalizations
+plot_6e=ggplot()+
+  #Plot uncertainty region for lower transmission scenario
+  geom_ribbon(data=data_intervention_UQ_low_beta|>filter(period_hosps!="drop"),
+              aes(x=Date, ymin = low95_hosps, ymax= high95_hosps),
+              fill="#f0a475",alpha=0.15)+
+  #Plot uncertainty region for higher transmission scenario
+  geom_ribbon(data=data_intervention_UQ_high_beta|>filter(period_hosps!="drop"),
+              aes(x=Date, ymin = low95_hosps, ymax= high95_hosps),
+              fill="#73340d", alpha=0.15)+
+  #Plot uncertainty region for status-quo scenario
+  geom_ribbon(data=data_fits_UQ|>filter(period_hosps!="drop"),
+              aes(x=Date, ymin = low95_hosps, ymax= high95_hosps),
+              fill="#D86018",alpha=0.15)+
+  #Plot data
+  geom_point(data=data_intervention_UQ_high_beta|>filter(period_hosps!="project"),
+             aes(x=Date,y=Hospitalizations,fill=period_hosps),
+             color="#D86018",alpha=1,pch=21)+
+  #Plot median trajectory for lower transmission scenario
+  geom_line(data=data_intervention_UQ_low_beta|>filter(period_hosps!="drop"),
+            aes(x=Date,y=median_hosps,linetype=period_hosps),
+            color="#f0a475")+
+  #Plot median trajectory for higher transmission scenario
+  geom_line(data=data_intervention_UQ_high_beta|>filter(period_hosps!="drop"),
+            aes(x=Date,y=median_hosps,linetype=period_hosps),
+            color="#73340d")+
+  #Plot median trajectory for status-quo scenario
+  geom_line(data=data_fits_UQ|>filter(period_hosps!="drop"),
+            aes(x=Date,y=median_hosps,linetype=period_hosps),
+            color="#D86018")+
+  #Vertical line for today's date
+  geom_vline(xintercept=today,color="grey80")+
+  #Additional plotting parameters
+  scale_fill_manual(guide="none", values=c("#D86018","white"))+
+  scale_linetype_manual(guide="none", values=c(1,2))+
+  scale_x_date(date_breaks = "1 month", date_labels =  "%b %Y")+
+  xlab("Date")+ylab("Hospitalizations")+
+  theme_classic(base_size=14)+
+  theme(axis.text.x=element_text(angle=20, hjust=1))
+
+#Deaths
+plot_6f=ggplot()+
+  #Plot uncertainty region for lower transmission scenario
+  geom_ribbon(data=data_intervention_UQ_low_beta|>filter(period_death!="drop"),
+              aes(x=Date, ymin = low95_death, ymax= high95_death),
+              fill="#6093d2",alpha=0.15)+
+  #Plot uncertainty region for higher transmission scenario
+  geom_ribbon(data=data_intervention_UQ_high_beta|>filter(period_death!="drop"),
+              aes(x=Date, ymin = low95_death, ymax= high95_death),
+              fill="#224877", alpha=0.15)+
+  #Plot uncertainty region for status-quo scenario
+  geom_ribbon(data=data_fits_UQ|>filter(period_death!="drop"),
+              aes(x=Date, ymin = low95_death, ymax= high95_death),
+              fill="#2F65A7",alpha=0.15)+
+  #Plot data
+  geom_point(data=data_intervention_UQ_high_beta|>filter(period_death!="project"),
+             aes(x=Date,y=Deaths,fill=period_death),
+             color="#2F65A7",alpha=1,pch=21)+
+  #Plot median trajectory for lower transmission scenario
+  geom_line(data=data_intervention_UQ_low_beta|>filter(period_death!="drop"),
+            aes(x=Date,y=median_death,linetype=period_death),
+            color="#6093d2")+
+  #Plot median trajectory for higher transmission scenario
+  geom_line(data=data_intervention_UQ_high_beta|>filter(period_death!="drop"),
+            aes(x=Date,y=median_death,linetype=period_death),
+            color="#224877")+
+  #Plot median trajectory for status-quo scenario
+  geom_line(data=data_fits_UQ|>filter(period_death!="drop"),
+            aes(x=Date,y=median_death,linetype=period_death),
+            color="#2F65A7")+
+  #Vertical line for today's date
+  geom_vline(xintercept=today,color="grey80")+
+  #Additional plotting parameters
+  scale_fill_manual(guide="none", values=c("#2F65A7","white"))+
+  scale_linetype_manual(guide="none", values=c(1,2))+
+  scale_x_date(date_breaks = "1 month", date_labels =  "%b %Y")+
+  xlab("Date")+ylab("Deaths")+
+  theme_classic(base_size=14)+
+  theme(axis.text.x=element_text(angle=20, hjust=1))
+
+ggarrange(plot_6d,plot_6e,plot_6f,nrow=1,ncol=3)
+```
+
+### Retrospective scenario comparison to eventually reported data
+Compared to a 45% reduced transmission scenario
+```{r, echo=FALSE}
+#Cases
+plot_6g= ggplot()+
+  #Plot uncertainty region for retrospective scenario
+  geom_ribbon(data=data_intervention_UQ_retro,
+              aes(x=Date, ymin = low95_cases, ymax= high95_cases),
+              fill="#9A3324", alpha=0.15)+
+  #Plot uncertainty region for status-quo scenario
+  geom_ribbon(data=data_fits_UQ,
+              aes(x=Date, ymin = low50_cases, ymax= high50_cases),
+              fill="grey25",alpha=0.15)+
+  #Plot data 
+  geom_point(data=data_fits_UQ,
+             aes(x=Date,y=Cases,fill=period_cases),
+             color="grey25",alpha=1,pch=21)+
+  #Plot median trajectory for retrospective scenario
+  geom_line(data=data_intervention_UQ_retro,
+            aes(x=Date,y=median_cases,linetype=period_cases),
+            color="#9A3324")+
+  #Plot median trajectory for status-quo scenario
+  geom_line(data=data_fits_UQ,
+            aes(x=Date,y=median_cases,linetype=period_cases),
+            color="grey25")+
+  #Vertical line for today's date
+  geom_vline(xintercept=today,color="grey80")+
+  #Additional plotting parameters
+  scale_linetype_manual(guide="none", values=c(1,2))+
+  scale_fill_manual(guide="none", values=c("grey25","white"))+
+  xlab("Date")+ylab("Cases")+
+  scale_x_date(date_breaks = "1 month", date_labels =  "%b %Y")+
+  theme_classic(base_size=14)+
+  theme(axis.text.x=element_text(angle=20, hjust=1))
+
+#Hospitalizations
+plot_6h= ggplot()+
+  #Plot uncertainty region for retrospective scenario
+  geom_ribbon(data=data_intervention_UQ_retro|>filter(period_hosps!="drop"),
+              aes(x=Date, ymin = low95_hosps, ymax= high95_hosps),
+              fill="#9A3324", alpha=0.15)+
+  #Plot uncertainty region for status-quo scenario
+  geom_ribbon(data=data_fits_UQ|>filter(period_hosps!="drop"),
+              aes(x=Date, ymin = low50_hosps, ymax= high50_hosps),
+              fill="#D86018",alpha=0.15)+
+  #Plot data 
+  geom_point(data=data_fits_UQ,
+             aes(x=Date,y=Hospitalizations,fill=period_hosps),
+             color="#D86018",alpha=1,pch=21)+
+  #Plot median trajectory for retrospective scenario
+  geom_line(data=data_intervention_UQ_retro|>filter(period_hosps!="drop"),
+            aes(x=Date,y=median_hosps,linetype=period_hosps),
+            color="#9A3324")+
+  #Plot median trajectory for status-quo scenario
+  geom_line(data=data_fits_UQ|>filter(period_hosps!="drop"),
+            aes(x=Date,y=median_hosps,linetype=period_hosps),
+            color="#D86018")+
+  #Vertical line for today's date
+  geom_vline(xintercept=today,color="grey80")+
+  #Additional plotting parameters
+  scale_linetype_manual(guide="none", values=c(1,2))+
+  scale_fill_manual(guide="none", values=c("#D86018","white","white"))+
+  xlab("Date")+ylab("Hospitalizations")+
+  scale_x_date(date_breaks = "1 month", date_labels =  "%b %Y")+
+  theme_classic(base_size=14)+
+  theme(axis.text.x=element_text(angle=20, hjust=1))
+
+#Deaths
+plot_6i= ggplot()+
+  #Plot uncertainty region for retrospective scenario
+  geom_ribbon(data=data_intervention_UQ_retro|>filter(period_death!="drop"),
+              aes(x=Date, ymin = low95_death, ymax= high95_death),
+              fill="#9A3324", alpha=0.15)+
+  #Plot uncertainty region for status-quo scenario
+  geom_ribbon(data=data_fits_UQ|>filter(period_death!="drop"),
+              aes(x=Date, ymin = low50_death, ymax= high50_death),
+              fill="#2F65A7",alpha=0.15)+
+  #Plot data 
+  geom_point(data=data_fits_UQ,
+             aes(x=Date,y=Deaths,fill=period_death),
+             color="#2F65A7",alpha=1,pch=21)+
+  #Plot median trajectory for retrospective scenario
+  geom_line(data=data_intervention_UQ_retro|>filter(period_death!="drop"),
+            aes(x=Date,y=median_death,linetype=period_death),
+            color="#9A3324")+
+  #Plot median trajectory for status-quo scenario
+  geom_line(data=data_fits_UQ|>filter(period_death!="drop"),
+            aes(x=Date,y=median_death,linetype=period_death),
+            color="#2F65A7")+
+  #Vertical line for today's date
+  geom_vline(xintercept=today,color="grey80")+
+  #Additional plotting parameters
+  scale_linetype_manual(guide="none", values=c(1,2))+
+  scale_fill_manual(guide="none", values=c("#2F65A7","white","white"))+
+  xlab("Date")+ylab("Deaths")+
+  scale_x_date(date_breaks = "1 month", date_labels =  "%b %Y")+
+  theme_classic(base_size=14)+
+  theme(axis.text.x=element_text(angle=20, hjust=1))
+
+ggarrange(plot_6g,plot_6h,plot_6i,nrow=1,ncol=3)
+```
+
+
+```{r, include=FALSE}
+#Arrange plots
+plot_6=ggarrange(plot_6a,plot_6b,plot_6c,
+                 plot_6d,plot_6e,plot_6f,
+                 plot_6g,plot_6h,plot_6i,nrow=3,ncol=3,
+                 labels=c("A)","B)","C)",
+                          "D)","E)","F)",
+                          "G)","H)","I)"))
+plot_6
+```
+
+```{r, include=FALSE}
+#Save plots
+ggsave("Figure 6.png",plot_6,height=4, width=6,scale=2)
+ggsave("Figure 6.pdf",plot_6,height=4, width=6,scale=2)
+```
