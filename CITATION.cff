@@ -1,0 +1,9 @@
+cff-version: 1.1.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: Andrew 
+  given-names: Brouwer
+orcid: https://orcid.org/0000-0002-3779-5287
+title: Infectious disease modeling for public health case studies code repository: Version 1.0
+version: V1.0
+date-released: 2025-10-02
